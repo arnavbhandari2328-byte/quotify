@@ -4,5 +4,7 @@ google-generativeai
 python-dotenv
 Flask-Mail
 gunicorn
-pdfkit
+docxtpl
+python-docx
+docx2pdf
 pytest
