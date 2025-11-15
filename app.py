@@ -42,6 +42,55 @@ WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-pro')
 
+# --- LLM Configuration with Fallback ---
+
+# The prompt is now a global constant
+PROMPT = """You are an AI assistant that receives WhatsApp webhook messages and MUST OUTPUT a single valid JSON object only (no markdown, no text).
+
+Required JSON format always (exact keys, never change or add keys):
+
+{
+  "phone": "",
+  "customer_name": "",
+  "message_text": "",
+  "product": "",
+  "specification": "",
+  "quantity": "",
+  "rate": "",
+  "hsn_code": "",
+  "email": ""
+}
+
+Rules:
+1. Always output valid JSON only. Nothing else.
+2. If you can extract a field, fill it. If not, the field value MUST be an empty string "".
+3. Do NOT add any extra fields or metadata.
+4. Phone field should contain digits only (strip +, spaces, or punctuation). If phone cannot be extracted from message text, use any phone in the webhook metadata. If still unavailable, return "".
+5. If parsing fails or input is ambiguous, return the JSON with all fields set to "" (no errors or prose).
+6. No surrounding text, no explanation, no code fences — raw JSON only.
+
+Example output (if found):
+{"phone":"919009000396","customer_name":"Rudra","message_text":"Send quote 110 ...","product":"5inch SS 316L sheets","specification":"5inch","quantity":"5psc","rate":"25000","hsn_code":"7219","email":"arnavbhandari1777@gmail.com"}
+
+If unable to extract, respond:
+{"phone":"","customer_name":"","message_text":"","product":"","specification":"","quantity":"","rate":"","hsn_code":"","email":""}
+"""
+
+# Candidate models in priority order.
+CANDIDATE_MODELS = [
+    "gemini-1.5-flash", # Using the newer, faster models first
+    "gemini-pro",
+]
+
+# Safe fallback JSON to ensure parsed_data is never None.
+SAFE_EMPTY_JSON = {
+  "phone": "", "customer_name": "", "message_text": "", "product": "",
+  "specification": "", "quantity": "", "rate": "", "hsn_code": "", "email": ""
+}
+
+# --- End LLM Configuration ---
+
+
 def send_whatsapp_message(to_number, message_text):
     """Sends a text message to a WhatsApp number."""
     url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
@@ -82,56 +131,59 @@ def send_whatsapp_document(to_number, document_url, filename):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending document to {to_number}: {e}")
 
-def call_gemini_to_parse(message_text):
-    """Uses Gemini to parse the user's message into structured JSON."""
-    try:
-        model = gemini_model
-        # Note: The double curly braces {{ and }} are used to escape the JSON structure within the f-string.
-        prompt = f"""You are an AI assistant that reads WhatsApp messages and converts them into a clean, structured JSON object.
+def call_gemini_to_parse(user_message: str) -> dict:
+    """
+    Calls candidate LLM models with retry logic to parse a user message.
+    It uses the raw requests library for maximum control.
+    Returns a structured JSON object, falling back to SAFE_EMPTY_JSON on total failure.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+    full_prompt = PROMPT + f"\n\nParse the following message:\n\"{user_message}\""
 
-The JSON must always follow this exact format:
-
-{{
-  "customer_name": "",
-  "product": "",
-  "specification": "",
-  "quantity": "",
-  "rate": "",
-  "hsn_code": "",
-  "email": "",
-  "phone": ""
-}}
-
-Rules:
-- Extract details from any natural-language WhatsApp message.
-- If any field is missing, return "" for that field.
-- Never change field names.
-- Never add extra fields.
-- Never return explanations, only the JSON object.
-- Phone numbers should be digits only.
-- If the message is unclear, fill whatever you can and leave the rest as "".
-
-Here is the user's message to parse:
-"{message_text}"
-"""
-        response = model.generate_content(prompt)
-
-        # Clean up the response to ensure it's valid JSON
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+    for model in CANDIDATE_MODELS:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        payload = { "contents": [{ "parts": [{ "text": full_prompt }] }] }
         
-        logging.info(f"Gemini raw response: {response.text}")
-        logging.info(f"Cleaned JSON string: {cleaned_text}")
+        logging.info(f"Attempting to call model: {model}")
+        try:
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+        except Exception as e:
+            logging.warning(f"Model call network error for {model}: {e}")
+            continue
 
-        parsed_json = json.loads(cleaned_text)
-        return parsed_json
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+                # Extract text from the response structure
+                text_out = body['candidates'][0]['content']['parts'][0]['text']
+                cleaned_text = text_out.strip().replace("```json", "").replace("```", "").strip()
+                
+                parsed = json.loads(cleaned_text)
+                required = set(SAFE_EMPTY_JSON.keys())
+                if isinstance(parsed, dict) and required.issubset(set(parsed.keys())):
+                    logging.info(f"Successfully parsed response from {model}")
+                    return parsed
+                else:
+                    logging.warning(f"Parsed JSON missing required keys from model {model}")
+                    continue
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                logging.warning(f"Failed to parse model {model} output as JSON: {e}")
+                logging.warning(f"Malformed string/body was: {resp.text[:500]}")
+                continue
 
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding JSON from Gemini: {e}")
-        logging.error(f"Malformed string: {cleaned_text}")
-        return None
-    except Exception as e:
-        logging.error(f"An error occurred calling Gemini API: {e}")
-        return None
+        elif resp.status_code == 404:
+            logging.info(f"Model {model} not available (404) — trying next")
+            continue
+        else:
+            logging.warning(f"Model {model} returned HTTP {resp.status_code}: {resp.text[:300]}")
+            continue
+
+    # All models failed -> return safe empty JSON to avoid "Parsed data is None".
+    logging.error("All model attempts failed — returning SAFE_EMPTY_JSON")
+    return SAFE_EMPTY_JSON
 
 def generate_quotation_document(parsed_data, phone_number):
     """
@@ -146,8 +198,8 @@ def generate_quotation_document(parsed_data, phone_number):
         "steel coils": {"IS 2062": 48000, "HR": 47500},
         "sheets": {"CRCA": 60000, "GP": 62000}
     }
-    product = parsed_data.get("product", "N/A")
-    grade = parsed_data.get("grade", "N/A")
+    product = parsed_data.get("product") or "N/A"
+    grade = parsed_data.get("specification") or "N/A" # Using 'specification' as 'grade'
     price_per_ton = mock_price_db.get(product, {}).get(grade, 50000) # Default price
 
     # 2. Create HTML content for the PDF
@@ -179,7 +231,7 @@ def generate_quotation_document(parsed_data, phone_number):
             </div>
             <table>
                 <tr><th>Product</th><th>Grade</th><th>Quantity</th><th>Unit Price (per Ton)</th></tr>
-                <tr><td>{product}</td><td>{grade}</td><td>{parsed_data.get("quantity", "N/A")}</td><td>INR {price_per_ton}</td></tr>
+                <tr><td>{product}</td><td>{grade}</td><td>{parsed_data.get("quantity") or "N/A"}</td><td>INR {price_per_ton}</td></tr>
             </table>
         </body>
     </html>
@@ -225,8 +277,8 @@ def send_internal_email_alert(phone_number, message_text, parsed_data, error_mes
             
             Parsed Data:
             - Product: {parsed_data.get('product', 'N/A')}
+            - Specification: {parsed_data.get('specification', 'N/A')}
             - Quantity: {parsed_data.get('quantity', 'N/A')}
-            - Grade: {parsed_data.get('grade', 'N/A')}
             
             A quotation document has been sent to the customer.
             """
@@ -300,9 +352,6 @@ def whatsapp_webhook():
             logging.info(f"--- Processing message from {user_phone_number}: '{user_message_text}' ---")
 
             parsed_data = call_gemini_to_parse(user_message_text)
-            if not parsed_data:
-                raise ValueError("Failed to parse message with Gemini. Parsed data is None.")
-
             doc_url, doc_filename = generate_quotation_document(parsed_data, user_phone_number)
             send_whatsapp_message(user_phone_number, "Here is your quote!")
             send_whatsapp_document(user_phone_number, doc_url, doc_filename)
