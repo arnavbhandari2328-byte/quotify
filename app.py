@@ -256,6 +256,9 @@ def webhook():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
+        # !!! --- ADD THIS NEW LINE --- !!!
+        print(f"!!! DEBUG: Token from Facebook: '{token}'. My token from env: '{VERIFY_TOKEN}'")
+        # !!! --- END OF NEW LINE --- !!!
         if mode == "subscribe" and token == VERIFY_TOKEN:
             logging.info("WEBHOOK_VERIFIED")
             return challenge, 200
