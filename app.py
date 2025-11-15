@@ -15,8 +15,9 @@ import google.generativeai as genai
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from .env file
-load_dotenv()
+# Load .env file only if this is NOT on Render
+if os.getenv("RENDER") is None:
+    load_dotenv()
 
 app = Flask(__name__)
 
