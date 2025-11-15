@@ -86,19 +86,34 @@ def call_gemini_to_parse(message_text):
     """Uses Gemini to parse the user's message into structured JSON."""
     try:
         model = gemini_model
-        prompt = f"""
-        You are an intelligent assistant for a steel company.
-        Your task is to parse a user's request for a price quote into a structured JSON object.
-        The user's message is: "{message_text}"
+        # Note: The double curly braces {{ and }} are used to escape the JSON structure within the f-string.
+        prompt = f"""You are an AI assistant that reads WhatsApp messages and converts them into a clean, structured JSON object.
 
-        Extract the following fields:
-        - "product": The type of steel product (e.g., 'TMT bars', 'steel coils', 'sheets').
-        - "quantity": The amount, including units (e.g., '10 tons', '500 kgs').
-        - "grade": The grade or specification of the steel (e.g., 'Fe 550D', 'IS 2062').
+The JSON must always follow this exact format:
 
-        If a field is not mentioned, use a value of null.
-        Return ONLY the JSON object, with no other text or formatting.
-        """
+{{
+  "customer_name": "",
+  "product": "",
+  "specification": "",
+  "quantity": "",
+  "rate": "",
+  "hsn_code": "",
+  "email": "",
+  "phone": ""
+}}
+
+Rules:
+- Extract details from any natural-language WhatsApp message.
+- If any field is missing, return "" for that field.
+- Never change field names.
+- Never add extra fields.
+- Never return explanations, only the JSON object.
+- Phone numbers should be digits only.
+- If the message is unclear, fill whatever you can and leave the rest as "".
+
+Here is the user's message to parse:
+"{message_text}"
+"""
         response = model.generate_content(prompt)
 
         # Clean up the response to ensure it's valid JSON
