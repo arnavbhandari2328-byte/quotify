@@ -3,7 +3,10 @@ import json
 import logging
 import hmac
 import hashlib
+import subprocess
+import datetime
 from functools import wraps
+from pathlib import Path
 from flask import Flask, request, jsonify
 from flask import abort
 import tempfile
@@ -11,6 +14,7 @@ from flask_mail import Mail, Message
 from dotenv import load_dotenv
 import requests
 import google.generativeai as genai
+from docxtpl import DocxTemplate
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -88,7 +92,165 @@ SAFE_EMPTY_JSON = {
   "specification": "", "quantity": "", "rate": "", "hsn_code": "", "email": ""
 }
 
-# --- End LLM Configuration ---
+# Template path (update if Template.docx is in a different location)
+TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "Template.docx")
+
+
+def _coerce_number(value):
+    """Try to parse an int/float from string; return None if not numeric."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value).replace(',', '').strip()
+    try:
+        if '.' in s:
+            return float(s)
+        return int(s)
+    except Exception:
+        return None
+
+
+def _normalize_phone(phone):
+    """Extract digits only from phone number."""
+    if not phone:
+        return ""
+    return ''.join(ch for ch in str(phone) if ch.isdigit())
+
+
+def generate_quote_pdf(parsed_data: dict, template_path: str = TEMPLATE_PATH) -> str:
+    """
+    Fill Template.docx and convert to PDF. Returns the PDF file path.
+
+    parsed_data: dict with keys matching your JSON (phone, customer_name, product, quantity, rate, units, hsn_code, etc.)
+    template_path: path to Template.docx
+    """
+
+    # Ensure parsed_data has defaults
+    data = dict(SAFE_EMPTY_JSON)
+    if parsed_data:
+        data.update(parsed_data)
+
+    # Normalize and compute fields
+    phone = _normalize_phone(data.get("phone", ""))
+    customer_name = data.get("customer_name", "") or ""
+    product = data.get("product", "") or ""
+    specification = data.get("specification", "") or ""
+    message_text = data.get("message_text", "") or ""
+    email = data.get("email", "") or ""
+    hsn = data.get("hsn_code", "") or data.get("hsn", "") or ""
+    units = data.get("units", "") or data.get("units_text", "") or ""
+    
+    # Quantity & rate - try coercing numeric and compute line total if possible
+    qty_raw = data.get("quantity", "")
+    rate_raw = data.get("rate", "")
+    qty = _coerce_number(qty_raw)
+    rate = _coerce_number(rate_raw)
+    total_amount = ""
+    
+    if qty is not None and rate is not None:
+        try:
+            total_val = qty * rate
+            # format without trailing decimals if integer
+            total_amount = f"{int(total_val):,}" if float(total_val).is_integer() else f"{total_val:,.2f}"
+        except Exception:
+            total_amount = ""
+    else:
+        # If quantity/rate are strings like "5psc" or "25000 per pcs", try to extract digits
+        try:
+            qty_digits = ''.join(ch for ch in str(qty_raw) if ch.isdigit())
+            rate_digits = ''.join(ch for ch in str(rate_raw) if ch.isdigit())
+            if qty_digits and rate_digits:
+                total_val = int(qty_digits) * int(rate_digits)
+                total_amount = f"{total_val:,}"
+        except Exception:
+            total_amount = ""
+
+    # Quotation number & date
+    q_no = data.get("q_no") or f"{datetime.datetime.utcnow().strftime('%y%m%d')}-{phone[-4:] if phone else '0000'}"
+    today_str = datetime.datetime.utcnow().strftime("%d-%b-%Y")
+
+    # Build context mapping matching placeholders in Template.docx
+    context = {
+        "q_no": q_no,
+        "date": today_str,
+        "company_name": data.get("company_name", "") or "",
+        "customer_name": customer_name,
+        "product": product or specification,
+        "quantity": str(data.get("quantity", "")),
+        "rate": str(data.get("rate", "")),
+        "units": units,
+        "hsn": hsn,
+        "total": total_amount,
+        "email": email,
+        "phone": phone,
+        "message_text": message_text
+    }
+
+    # Load docx template and render
+    try:
+        tpl = DocxTemplate(template_path)
+        tpl.render(context)
+    except FileNotFoundError:
+        logging.error(f"Template file not found at {template_path}")
+        raise
+    except Exception as e:
+        logging.error(f"Error rendering template: {e}")
+        raise
+
+    # Save temporary docx and convert to pdf
+    tmp_dir = tempfile.mkdtemp(prefix="quote_")
+    tmp_docx = os.path.join(tmp_dir, f"quote_{q_no}.docx")
+    tmp_pdf = os.path.join(tmp_dir, f"quote_{q_no}.pdf")
+    
+    try:
+        tpl.save(tmp_docx)
+        logging.info(f"Temporary DOCX saved to {tmp_docx}")
+    except Exception as e:
+        logging.error(f"Error saving temporary DOCX: {e}")
+        raise
+
+    # Convert using LibreOffice (recommended on Linux/Render)
+    try:
+        # soffice will produce PDF in the same tmp_dir
+        subprocess.run([
+            "soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp_dir, tmp_docx
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        
+        # LibreOffice names the file with .pdf extension same basename
+        if os.path.exists(tmp_pdf):
+            logging.info("PDF generated and saved to temporary file: %s", tmp_pdf)
+            return tmp_pdf
+        else:
+            # If LibreOffice produced differently, search directory
+            for f in os.listdir(tmp_dir):
+                if f.lower().endswith(".pdf"):
+                    return os.path.join(tmp_dir, f)
+            raise RuntimeError("LibreOffice conversion succeeded but PDF not found.")
+    except FileNotFoundError:
+        logging.warning("LibreOffice (soffice) not found. Trying docx2pdf fallback (Windows).")
+    except subprocess.CalledProcessError as e:
+        logging.warning("LibreOffice conversion error: %s; stderr: %s", e, e.stderr.decode(errors='ignore'))
+    except Exception as e:
+        logging.warning("LibreOffice conversion failed: %s", e)
+
+    # Fallback: docx2pdf (Windows)
+    try:
+        from docx2pdf import convert
+        convert(tmp_docx, tmp_pdf)
+        if os.path.exists(tmp_pdf):
+            logging.info("PDF generated (docx2pdf) and saved to: %s", tmp_pdf)
+            return tmp_pdf
+    except Exception as e:
+        logging.error("Fallback docx->pdf failed: %s", e)
+
+    # Last resort: return docx path so caller can decide
+    logging.error("Could not convert docx to pdf. Returning DOCX path.")
+    return tmp_docx
+
+# --- End PDF Generation ---
+
+
 
 
 def send_whatsapp_message(to_number, message_text):
@@ -184,72 +346,6 @@ def call_gemini_to_parse(user_message: str) -> dict:
     # All models failed -> return safe empty JSON to avoid "Parsed data is None".
     logging.error("All model attempts failed — returning SAFE_EMPTY_JSON")
     return SAFE_EMPTY_JSON
-
-def generate_quotation_document(parsed_data, phone_number):
-    """
-    Generates a quotation PDF from parsed data, saves it to a temporary file,
-    and returns a public URL and filename.
-    """
-    logging.info(f"Generating a real quotation document for: {parsed_data}")
-
-    # 1. Mock database lookup for price
-    mock_price_db = {
-        "TMT bars": {"Fe 550D": 55000, "Fe 500": 52000},
-        "steel coils": {"IS 2062": 48000, "HR": 47500},
-        "sheets": {"CRCA": 60000, "GP": 62000}
-    }
-    product = parsed_data.get("product") or "N/A"
-    grade = parsed_data.get("specification") or "N/A" # Using 'specification' as 'grade'
-    price_per_ton = mock_price_db.get(product, {}).get(grade, 50000) # Default price
-
-    # 2. Create HTML content for the PDF
-    html_content = f"""
-    <html>
-        <!-- (HTML content for PDF generation remains the same) -->
-        <head><style>
-            body {{ font-family: sans-serif; margin: 40px; }}
-            h1 {{ color: #333; }}
-            .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
-            .company-details {{ text-align: right; }}
-            .quote-details {{ margin-top: 40px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-            th {{ background-color: #f2f2f2; }}
-        </style></head>
-        <body>
-            <div class="header">
-                <h1>Quotation</h1>
-                <div class="company-details">
-                    <strong>Your Steel Company Inc.</strong><br>
-                    123 Steel Road, Metalburg<br>
-                    sales@yoursteelco.com
-                </div>
-            </div>
-            <div class="quote-details">
-                <strong>Quote For:</strong> {phone_number}<br>
-                <strong>Date:</strong> {os.getenv('CURRENT_DATE', '2023-10-27')}
-            </div>
-            <table>
-                <tr><th>Product</th><th>Grade</th><th>Quantity</th><th>Unit Price (per Ton)</th></tr>
-                <tr><td>{product}</td><td>{grade}</td><td>{parsed_data.get("quantity") or "N/A"}</td><td>INR {price_per_ton}</td></tr>
-            </table>
-        </body>
-    </html>
-    """
-
-    # 3. Generate PDF and save to a temporary file
-    # Note: pdfkit is not included in your new code, so this will fail if not installed
-    import pdfkit
-    temp_pdf_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdfkit.from_string(html_content, temp_pdf_file.name)
-    logging.info(f"PDF generated and saved to temporary file: {temp_pdf_file.name}")
-
-    # --- IMPORTANT ---
-    # In a real application, you would now upload `temp_pdf_file.name` to a cloud storage
-    # (like S3) and get a public URL. For now, we return a dummy URL.
-    public_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
-    filename = f"Quotation_{parsed_data.get('product', 'details')}.pdf"
-    return public_url, filename
 
 def send_internal_email_alert(phone_number, message_text, parsed_data, error_message=None):
     """Sends an internal email alert to the admin about incoming requests or errors."""
@@ -352,9 +448,17 @@ def whatsapp_webhook():
             logging.info(f"--- Processing message from {user_phone_number}: '{user_message_text}' ---")
 
             parsed_data = call_gemini_to_parse(user_message_text)
-            doc_url, doc_filename = generate_quotation_document(parsed_data, user_phone_number)
+            
+            # Generate PDF quotation from template
+            pdf_path = generate_quote_pdf(parsed_data)
+            filename = f"Quotation_{parsed_data.get('product', 'quote')}.pdf"
+            
+            # Read the PDF file and send via WhatsApp
+            with open(pdf_path, "rb") as fh:
+                file_bytes = fh.read()
+            
             send_whatsapp_message(user_phone_number, "Here is your quote!")
-            send_whatsapp_document(user_phone_number, doc_url, doc_filename)
+            send_whatsapp_document(user_phone_number, pdf_path, filename)
             send_internal_email_alert(user_phone_number, user_message_text, parsed_data)
             logging.info("--- Successfully processed request and sent quotation ---")
 
