@@ -40,7 +40,7 @@ WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")
 
 # Configure the Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-pro')
 
 def send_whatsapp_message(to_number, message_text):
     """Sends a text message to a WhatsApp number."""
