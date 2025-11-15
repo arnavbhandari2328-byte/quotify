@@ -3,12 +3,14 @@ import json
 import logging
 import hmac
 import hashlib
+import threading
 import subprocess
 import datetime
 from functools import wraps
 from pathlib import Path
 from flask import Flask, request, jsonify
 from flask import abort
+from typing import Optional
 import tempfile
 from flask_mail import Mail, Message
 from dotenv import load_dotenv
@@ -248,6 +250,74 @@ def generate_quote_pdf(parsed_data: dict, template_path: str = TEMPLATE_PATH) ->
     logging.error("Could not convert docx to pdf. Returning DOCX path.")
     return tmp_docx
 
+def safe_log_error(msg, **kwargs):
+    """Helper that avoids accessing missing locals in f-strings."""
+    try:
+        logging.error(msg.format(**kwargs), exc_info=True)
+    except Exception:
+        # fallback: do not crash on logging
+        logging.exception("Logging failed while handling error.")
+
+def process_message_background(user_phone: str, user_message_text: str, body: dict):
+    """
+    Heavy processing in background:
+      - call LLM
+      - parse result
+      - generate docx/pdf
+      - send file and emails
+    """
+    try:
+        # 1) call LLM safely with your existing wrapper (which returns SAFE_EMPTY_JSON on failure)
+        parsed_data = call_gemini_to_parse(user_message_text)
+        # ensure parsed is a dict and has phone key
+        if not isinstance(parsed_data, dict):
+            parsed_data = {}
+        parsed_data.setdefault("phone", user_phone or "")
+
+        # 2) generate PDF/DOCX (this function does lazy import and returns docx path if conversion not available)
+        # Using a Render-specific path as requested.
+        out_path = generate_quote_pdf(parsed_data, template_path="/opt/render/project/src/Template.docx")
+        filename = f"Quotation_{parsed_data.get('product', 'quote')}.pdf"
+
+        # 3) send via WhatsApp or API - this requires a public URL.
+        # For now, we will continue to use a placeholder URL as the file upload logic is not yet implemented.
+        try:
+            # --- URGENT: The generated PDF must be uploaded to a public URL first ---
+            # The line below uses a placeholder. In production, you would upload `out_path`
+            # to a cloud service (e.g., S3, Cloudinary) and get a real public URL.
+            public_doc_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" # Placeholder
+            # -------------------------------------------------------------------------
+            
+            send_whatsapp_message(user_phone, "Here is your quote!")
+            send_whatsapp_document(user_phone, public_doc_url, filename)
+            logging.info("Document sent to %s, status: sent", parsed_data.get("phone", ""))
+        except Exception as e:
+            logging.warning("Failed to send document to %s: %s", parsed_data.get("phone", ""), e)
+
+        # 4) send internal alert email (best-effort)
+        try:
+            send_internal_email_alert(parsed_data.get("phone", ""), user_message_text, parsed_data)
+        except Exception as e:
+            logging.warning("send_internal_email_alert failed (non-fatal): %s", e)
+
+    except Exception as e:
+        logging.exception("Background processing failed: %s", e)
+        # Send an error message back to the user in case of failure
+        try:
+            error_message = "I'm sorry, I ran into an error processing your request. A human will be with you shortly."
+            send_whatsapp_message(user_phone, error_message)
+            send_internal_email_alert(user_phone, user_message_text, None, error_message=str(e))
+        except Exception as alert_e:
+            logging.error("Failed to send error notification to user/admin: %s", alert_e)
+    finally:
+        # Clean up the temporary directory created by generate_quote_pdf
+        if 'out_path' in locals() and out_path:
+            tmp_dir = os.path.dirname(out_path)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logging.info(f"Cleaned up temporary directory: {tmp_dir}")
+        return
+
 # --- End PDF Generation ---
 
 
@@ -398,6 +468,11 @@ def index():
 @app.route("/webhook", methods=["GET", "POST"])
 def whatsapp_webhook():
     """
+    Main webhook endpoint.
+    For GET, it handles verification.
+    For POST, it validates the signature, acknowledges the request immediately,
+    and spawns a background thread for heavy processing.
+
     Handles webhook verification and incoming messages from WhatsApp.
     """
     if request.method == "GET":
@@ -416,6 +491,11 @@ def whatsapp_webhook():
             return "Forbidden", 403
 
     elif request.method == "POST":
+        # init variables so logging or except blocks never crash
+        user_phone_number: Optional[str] = None
+        user_message_text: str = ""
+        body = {}
+
         # --- NEW: SIGNATURE VALIDATION ---
         signature = request.headers.get('X-Hub-Signature-256')
         if not signature:
@@ -438,39 +518,43 @@ def whatsapp_webhook():
         # --- END OF SIGNATURE VALIDATION ---
 
         # Now that we are secure, we can read the JSON
-        body = request.json
-
         try:
-            message = body['entry'][0]['changes'][0]['value']['messages'][0]
-            user_message_text = message['text']['body']
-            user_phone_number = message['from']
+            body = request.get_json(force=True, silent=True) or {}
 
-            logging.info(f"--- Processing message from {user_phone_number}: '{user_message_text}' ---")
+            # Safely dig into the expected structure.
+            entry = (body.get("entry") or [])
+            changes = (entry[0].get("changes") if entry and isinstance(entry[0], dict) else [])
+            value = (changes[0].get("value") if changes and isinstance(changes[0], dict) else {})
 
-            parsed_data = call_gemini_to_parse(user_message_text)
-            
-            # Generate PDF quotation from template
-            pdf_path = generate_quote_pdf(parsed_data)
-            filename = f"Quotation_{parsed_data.get('product', 'quote')}.pdf"
+            # message may or may not exist
+            messages = value.get("messages")
+            if messages and isinstance(messages, list) and len(messages) > 0:
+                message = messages[0]
+                user_phone_number = message.get("from") or ""
+                user_message_text = message.get("text", {}).get("body") or ""
+                
+                if not user_message_text:
+                    logging.info("Received a message event without text content. Ignoring.")
+                    return ("", 200)
 
-            # --- URGENT: The generated PDF must be uploaded to a public URL first ---
-            # The line below uses a placeholder. In production, you would upload pdf_path
-            # to a cloud service (e.g., S3, Cloudinary) and get a real public URL.
-            public_doc_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" # Placeholder
-            # -------------------------------------------------------------------------
+                logging.info("--- Processing message from %s: %r ---", user_phone_number, user_message_text)
 
-            send_whatsapp_message(user_phone_number, "Here is your quote!")
-            send_whatsapp_document(user_phone_number, public_doc_url, filename)
-            send_internal_email_alert(user_phone_number, user_message_text, parsed_data)
-            logging.info("--- Successfully processed request and sent quotation ---")
+                # spawn background thread to handle heavy work
+                worker = threading.Thread(
+                    target=process_message_background,
+                    args=(user_phone_number, user_message_text, body),
+                    daemon=True
+                )
+                worker.start()
+            else:
+                # Non-message update (status/read receipts etc.). Acknowledge with 200.
+                logging.info("Non-message webhook event received; ignoring. Raw event keys: %s", list(value.keys()))
+
+            return ("", 200)
 
         except Exception as e:
-            logging.error(f"Error in processing pipeline for {user_phone_number}: {e}", exc_info=True)
-            error_message = "I'm sorry, I ran into an error processing your request. A human will be with you shortly."
-            send_whatsapp_message(user_phone_number, error_message)
-            send_internal_email_alert(user_phone_number, user_message_text, None, error_message=str(e))
-
-        return 'OK', 200
+            safe_log_error("Error in webhook handler for {phone}: {err}", phone=(user_phone_number or "<unknown>"), err=str(e))
+            return ("", 500)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
