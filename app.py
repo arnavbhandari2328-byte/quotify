@@ -5,7 +5,7 @@ import hmac
 import hashlib
 from functools import wraps
 from flask import Flask, request, jsonify
-import pdfkit
+from flask import abort
 import tempfile
 from flask_mail import Mail, Message
 from dotenv import load_dotenv
@@ -35,29 +35,12 @@ mail = Mail(app)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")
 
 # Configure the Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-
-def verify_whatsapp_signature(f):
-    """Decorator to verify that the webhook request is from WhatsApp."""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        signature = request.headers.get("X-Hub-Signature-256")
-        if not signature:
-            logging.warning("Webhook request missing signature.")
-            return "Forbidden", 403
-
-        # The signature is 'sha256=' followed by the hex-encoded hash.
-        sha_name, signature_hash = signature.split("=", 1)
-        if sha_name == "sha256":
-            expected_hash = hmac.new(WHATSAPP_TOKEN.encode(), request.data, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected_hash, signature_hash):
-                logging.warning("Webhook signature mismatch.")
-                return "Forbidden", 403
-        return f(*args, **kwargs)
-    return decorated_function
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 def send_whatsapp_message(to_number, message_text):
     """Sends a text message to a WhatsApp number."""
@@ -102,7 +85,7 @@ def send_whatsapp_document(to_number, document_url, filename):
 def call_gemini_to_parse(message_text):
     """Uses Gemini to parse the user's message into structured JSON."""
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = gemini_model
         prompt = f"""
         You are an intelligent assistant for a steel company.
         Your task is to parse a user's request for a price quote into a structured JSON object.
@@ -155,6 +138,7 @@ def generate_quotation_document(parsed_data, phone_number):
     # 2. Create HTML content for the PDF
     html_content = f"""
     <html>
+        <!-- (HTML content for PDF generation remains the same) -->
         <head><style>
             body {{ font-family: sans-serif; margin: 40px; }}
             h1 {{ color: #333; }}
@@ -187,6 +171,8 @@ def generate_quotation_document(parsed_data, phone_number):
     """
 
     # 3. Generate PDF and save to a temporary file
+    # Note: pdfkit is not included in your new code, so this will fail if not installed
+    import pdfkit
     temp_pdf_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     pdfkit.from_string(html_content, temp_pdf_file.name)
     logging.info(f"PDF generated and saved to temporary file: {temp_pdf_file.name}")
@@ -247,81 +233,75 @@ def index():
     return "Server is running."
 
 @app.route("/webhook", methods=["GET", "POST"])
-def webhook():
+def whatsapp_webhook():
     """
     Handles webhook verification and incoming messages from WhatsApp.
     """
     if request.method == "GET":
         # WhatsApp webhook verification
         mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
+        token_from_facebook = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
-        # !!! --- ADD THIS NEW LINE --- !!!
-        print(f"!!! DEBUG: Token from Facebook: '{token}'. My token from env: '{VERIFY_TOKEN}'")
-        # !!! --- END OF NEW LINE --- !!!
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            logging.info("WEBHOOK_VERIFIED")
+        logging.info(f"!!! DEBUG: Token from Facebook: '{token_from_facebook}'. My token from env: '{WHATSAPP_VERIFY_TOKEN}'")
+
+        if mode == "subscribe" and token_from_facebook == WHATSAPP_VERIFY_TOKEN:
+            logging.info("INFO: Webhook verified.")
             return challenge, 200
         else:
-            # Respond with 403 Forbidden if tokens do not match
-            logging.warning("Webhook verification failed.")
+            logging.error("ERROR: Webhook verification failed.")
             return "Forbidden", 403
 
     elif request.method == "POST":
-        process_whatsapp_message(request.get_json())
-        return "OK", 200
+        # --- NEW: SIGNATURE VALIDATION ---
+        signature = request.headers.get('X-Hub-Signature-256')
+        if not signature:
+            logging.error("ERROR: Signature header missing!")
+            abort(403)
 
-@verify_whatsapp_signature
-def process_whatsapp_message(data):
-    """Handle the business logic of an incoming WhatsApp message."""
-    logging.info(f"Received webhook data: {json.dumps(data, indent=2)}")
+        signature = signature.split('=')[-1]
 
-    # Use .get() for safe dictionary access
-    entry = data.get("entry", [])
-    if not entry:
-        logging.warning("Webhook data missing 'entry' field.")
-        return
+        expected_signature = hmac.new(
+            bytes(WHATSAPP_APP_SECRET, 'latin-1'),
+            request.data, # Use request.data (raw body), NOT request.json
+            hashlib.sha256
+        ).hexdigest()
 
-    changes = entry[0].get("changes", [])
-    if not changes:
-        logging.warning("Webhook data missing 'changes' field.")
-        return
+        if not hmac.compare_digest(signature, expected_signature):
+            logging.error("ERROR: Webhook signature mismatch!")
+            abort(403)
 
-    value = changes[0].get("value", {})
-    if not value or "messages" not in value:
-        # This could be a status update, not a message. It's safe to ignore.
-        logging.info("Webhook data is not a user message. Ignoring.")
-        return
+        logging.info("INFO: Webhook signature VERIFIED.")
+        # --- END OF SIGNATURE VALIDATION ---
 
-    message = value["messages"][0]
-    if message.get("type") == "text":
-        phone_number = message["from"]
-        message_text = message.get("text", {}).get("body")
-
-        if not message_text:
-            logging.warning("Received text message with no body.")
-            return
-
-        logging.info(f"--- Processing message from {phone_number}: '{message_text}' ---")
+        # Now that we are secure, we can read the JSON
+        body = request.json
 
         try:
-            # 1. Call Gemini to parse the message
-            parsed_data = call_gemini_to_parse(message_text)
+            message = body['entry'][0]['changes'][0]['value']['messages'][0]
+            user_message_text = message['text']['body']
+            user_phone_number = message['from']
+
+            logging.info(f"--- Processing message from {user_phone_number}: '{user_message_text}' ---")
+
+            parsed_data = call_gemini_to_parse(user_message_text)
             if not parsed_data:
                 raise ValueError("Failed to parse message with Gemini. Parsed data is None.")
 
-            # 2. Generate the quotation document
-            doc_url, filename = generate_quotation_document(parsed_data, phone_number)
-            send_whatsapp_document(phone_number, doc_url, filename)
-            send_internal_email_alert(phone_number, message_text, parsed_data)
+            doc_url, doc_filename = generate_quotation_document(parsed_data, user_phone_number)
+            send_whatsapp_message(user_phone_number, "Here is your quote!")
+            send_whatsapp_document(user_phone_number, doc_url, doc_filename)
+            send_internal_email_alert(user_phone_number, user_message_text, parsed_data)
             logging.info("--- Successfully processed request and sent quotation ---")
 
         except Exception as e:
-            logging.error(f"Error in processing pipeline for {phone_number}: {e}", exc_info=True)
+            logging.error(f"Error in processing pipeline for {user_phone_number}: {e}", exc_info=True)
             error_message = "I'm sorry, I ran into an error processing your request. A human will be with you shortly."
-            send_whatsapp_message(phone_number, error_message)
-            send_internal_email_alert(phone_number, message_text, None, error_message=str(e))
+            send_whatsapp_message(user_phone_number, error_message)
+            send_internal_email_alert(user_phone_number, user_message_text, None, error_message=str(e))
+
+        return 'OK', 200
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(debug=True, host='0.0.0.0', port=port)
