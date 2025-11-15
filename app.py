@@ -452,13 +452,15 @@ def whatsapp_webhook():
             # Generate PDF quotation from template
             pdf_path = generate_quote_pdf(parsed_data)
             filename = f"Quotation_{parsed_data.get('product', 'quote')}.pdf"
-            
-            # Read the PDF file and send via WhatsApp
-            with open(pdf_path, "rb") as fh:
-                file_bytes = fh.read()
-            
+
+            # --- URGENT: The generated PDF must be uploaded to a public URL first ---
+            # The line below uses a placeholder. In production, you would upload pdf_path
+            # to a cloud service (e.g., S3, Cloudinary) and get a real public URL.
+            public_doc_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" # Placeholder
+            # -------------------------------------------------------------------------
+
             send_whatsapp_message(user_phone_number, "Here is your quote!")
-            send_whatsapp_document(user_phone_number, pdf_path, filename)
+            send_whatsapp_document(user_phone_number, public_doc_url, filename)
             send_internal_email_alert(user_phone_number, user_message_text, parsed_data)
             logging.info("--- Successfully processed request and sent quotation ---")
 
