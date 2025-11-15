@@ -35,7 +35,7 @@ mail = Mail(app)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
 # Configure the Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
